@@ -1,0 +1,10 @@
+[package]
+name = "criterion-cbor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+chrono = { version = "0.4.39", default-features = false, features = ["clock", "serde", "std"] }
+criterion = { version = "0.5.1", default-features = false }
+serde = { version = "1.0.217", features = ["derive"] }
+serde_cbor = "0.11.2"
