@@ -1,214 +1,341 @@
-//! A library to inspect the CBOR output of `cargo criterion`
+//! A library to access the CBOR output of `cargo criterion`
 //!
-//! The main entry point of this library is the [`read_trees()`] free function.
-//! Point it to the root of a Cargo project or workspace where `cargo criterion`
-//! has been run before in order to get started.
+//! The main entry point of this library is [`Search::in_cargo_root()`]. Point
+//! it to the root of a Cargo project or workspace, then call the
+//! [`find_all()`](Search::find_all) or
+//! [`find_in_paths()`](Search::find_in_paths) method of the resulting object to
+//! start enumerating data.
 
-use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Local, MappedLocalTime, NaiveDateTime, TimeZone, Utc};
 use criterion::Throughput;
 #[cfg(doc)]
 use criterion::{BenchmarkGroup, Criterion};
 use serde::Deserialize;
 use std::{
+    cmp::Ordering,
     ffi::OsStr,
-    fs::DirEntry,
     io,
+    iter::Peekable,
     path::{Path, PathBuf},
 };
+use walkdir::{DirEntry, WalkDir};
 
-/// Enumerate the top-level benchmarks and benchmark groups from a certain Cargo
-/// project or workspace
+/// Criterion benchmark data search
 ///
-/// `cargo_root` should point to the location of Cargo's `target` directory,
-/// i.e. to the workspace root in case of Cargo workspaces and the project
-/// directory otherwise. Furthermore, `cargo criterion` should have recorded
-/// at least one measurement before calling this function.
-pub fn read_trees(
-    cargo_root: impl AsRef<Path>,
-) -> io::Result<impl Iterator<Item = io::Result<BenchmarkTree>>> {
-    let mut criterion_data_root = cargo_root.as_ref().to_owned();
-    criterion_data_root.push("target");
-    criterion_data_root.push("criterion");
-    criterion_data_root.push("data");
-    // This is the "timeline" field of cargo-criterion's Model, which is
-    // curently unused by cargo-criterion and always set to "main".
-    criterion_data_root.push("main");
-    let iter =
-        std::fs::read_dir(criterion_data_root)?.map(|entry_res| entry_res.map(BenchmarkTree::new));
-    Ok(iter)
-}
-
-/// Node of the `cargo criterion` data hierarchy
-///
-/// `cargo criterion` produces a filesystem tree of data where each node can
-/// hold benchmark data and child nodes.
-///
-/// At least one of these must be present (a node must contain some benchmark
-/// data or at least one child). But sadly they can both be present, because
-/// `cargo criterion` doesn't guard against giving the same name to a benchmark
-/// and a benchmark group.
+/// You start a search with [`Search::in_cargo_root()`], which allows you to
+/// specify where the `target` directory of the project is located.
 #[derive(Debug)]
-pub struct BenchmarkTree {
-    root: DirEntry,
-    measurements: Option<(Option<Box<Path>>, Vec<DirEntry>)>,
-    children: Option<Vec<DirEntry>>,
+pub struct Search {
+    data_root: Box<Path>,
+    walker: walkdir::IntoIter,
 }
 //
-/// Take one of the inner `Option`s if it's still available from a previous
-/// `read_dir()` run, otherwise call `read_dir()` to fill it first then take it.
-macro_rules! take_or_read {
-    ($self_:ident.$vec:ident) => {
-        if let Some($vec) = $self_.$vec.take() {
-            Ok($vec)
-        } else {
-            $self_.read_dir().map(|()| {
-                $self_
-                    .$vec
-                    .take()
-                    .expect("Should have been filled by read_dir()")
-            })
-        }
-    };
-}
-//
-impl BenchmarkTree {
-    /// Wrap a `DirEntry` after checking that it matches our expectations for
-    /// `cargo-criterion`'s data directories.
-    fn new(root: DirEntry) -> Self {
-        debug_assert!(
-            root.file_type().ok().is_none_or(|ty| ty.is_dir()),
-            "Expected a benchmark data directory"
-        );
-        Self {
-            root,
-            measurements: None,
-            children: None,
-        }
-    }
-
-    /// Name of the directory holding this node's data
+impl Search {
+    /// Start by specifying the location of Cargo's `target` directory
     ///
-    /// This is a mangled form of the original Criterion group/function/input
-    /// name, where filename-unsafe characters like `/` have been replaced with
-    /// `_`.
+    /// For Cargo workspaces, this will be the root of the workspace. For
+    /// non-workspace projects, this will be the root of the Cargo project,
+    /// where the `Cargo.toml` file is located.
     ///
-    /// You can use this label to filter out data nodes at a minimal I/O cost.
-    pub fn directory_name(&self) -> String {
-        self.root
-            .file_name()
-            .into_string()
-            .expect("Criterion data directories should have Unicode names")
-    }
+    /// # Panics
+    ///
+    /// If the specified directory does not exist.
+    pub fn in_cargo_root(cargo_root: impl AsRef<Path>) -> Self {
+        // Find the Criterion data root
+        let cargo_root = cargo_root.as_ref();
+        assert!(cargo_root.exists(), "Specified Cargo root does not exist");
+        let mut data_root = cargo_root.to_owned();
+        data_root.push("target");
+        data_root.push("criterion");
+        data_root.push("data");
+        // This is the "timeline" field of cargo-criterion's Model, which is
+        // curently unused by cargo-criterion and always set to "main".
+        data_root.push("main");
+        let data_root = data_root.into_boxed_path();
 
-    /// Access the benchmark data from this node, if any
-    pub fn read_benchmark(&mut self) -> io::Result<Option<Benchmark>> {
-        let (metadata_path, measurements) = take_or_read!(self.measurements)?;
-        let benchmark =
-            metadata_path.map(move |metadata_path| Benchmark::new(metadata_path, measurements));
-        Ok(benchmark)
-    }
-
-    /// Access the benchmark data from this node and all child nodes below it
-    pub fn read_all_benchmarks(&mut self) -> io::Result<Vec<Benchmark>> {
-        let mut benchmarks = self.read_benchmark()?.into_iter().collect::<Vec<_>>();
-        let mut curr_children = self.read_children()?.collect::<Vec<_>>();
-        let mut next_children = Vec::new();
-        while !curr_children.is_empty() {
-            for mut child in curr_children.drain(..) {
-                benchmarks.extend(child.read_benchmark()?);
-                next_children.extend(child.read_children()?);
-            }
-            std::mem::swap(&mut curr_children, &mut next_children);
-        }
-        Ok(benchmarks)
-    }
-
-    /// Enumerate the child nodes of this [`BenchmarkTree`]
-    pub fn read_children(&mut self) -> io::Result<impl Iterator<Item = BenchmarkTree>> {
-        Ok(take_or_read!(self.children)?
-            .into_iter()
-            .map(BenchmarkTree::new))
-    }
-
-    /// Read out the contents of this data directory, if not done already
-    fn read_dir(&mut self) -> io::Result<()> {
-        debug_assert!(self.measurements.is_none() || self.children.is_none());
-        let root_path = self.root.path();
-        let mut children = Vec::new();
-        let mut measurements = Vec::new();
-        let mut metadata_path = None;
-        for entry in std::fs::read_dir(&root_path)? {
-            let entry = entry?;
-            match entry.file_type()? {
-                ty if ty.is_dir() => {
-                    children.push(entry);
-                }
-                ty if ty.is_file() => {
-                    let file_name = entry.file_name();
-                    if file_name == "benchmark.cbor" {
-                        metadata_path = Some(entry.path().into_boxed_path());
-                    } else {
-                        let file_name = file_name
-                            .to_str()
-                            .expect("Criterion file names should be Unicode");
-                        assert!(
-                            file_name.starts_with("measurement_") && file_name.ends_with(".cbor"),
-                            "Unexpected measurement file name"
-                        );
-                        measurements.push(entry);
-                    }
-                }
-                other_ty => {
-                    unreachable!(
-                        "Encountered unexpected file type {other_ty:?} in Criterion data directory {}",
-                        root_path.display()
+        // Set up the common directory-walking configuration
+        let walker = WalkDir::new(&data_root)
+            .min_depth(1)
+            .follow_root_links(false)
+            .sort_by(|entry1, entry2| {
+                // - Emit all files before emitting directories
+                // - Emit files in descending name order (this will yield all
+                //   measurement_xxx.cbor files first, sorted by decreasing
+                //   measurement date/time to put latest measurement first, then
+                //   the benchmark.cbor metadata file at the end)
+                // - Emit directories in ascending name order
+                let is_file_not_dir = |entry: &DirEntry| -> bool {
+                    let ty = entry.file_type();
+                    assert!(
+                        ty.is_dir() || ty.is_file(),
+                        "Criterion's data directory should only contain files and directories"
                     );
+                    ty.is_file()
+                };
+                match (is_file_not_dir(entry1), is_file_not_dir(entry2)) {
+                    // Files before directories
+                    (true, false) => Ordering::Less,
+                    (false, true) => Ordering::Greater,
+                    // Files in descending name order
+                    (true, true) => entry2.file_name().cmp(entry1.file_name()),
+                    // Directories in ascending name order
+                    (false, false) => entry1.file_name().cmp(entry2.file_name()),
+                }
+            })
+            .into_iter();
+        Self { data_root, walker }
+    }
+
+    /// Find all benchmark data in the specified Cargo project/workspace
+    pub fn find_all(self) -> impl Iterator<Item = walkdir::Result<Benchmark>> {
+        BenchmarkIter::new(self.data_root, self.walker)
+    }
+
+    /// Find benchmark data whose filesystem path matches a certain predicate
+    ///
+    /// Criterion organizes benchmark data into a filesystem hierarchy that
+    /// roughly matches the benchmark groups, function names and value strings
+    /// that were specified in the benchmark (with various subtleties). If you
+    /// know where the data that you are looking for is located, you can use
+    /// this variant of `find_all()` to restrict the filesystem walk to these
+    /// directories only.
+    ///
+    /// To cut off useless filesystem walk branches as early as possible, the
+    /// predicate will be successively called for each component of the
+    /// filesystem path. So if you want to select benchmark data from location
+    /// `a/b/c` only, your filter should successively match for three
+    /// directories: first `a` at depth 1, then `b` at depth 2, and finally `c`
+    /// at depth 3.
+    pub fn find_in_paths<'path_filter>(
+        self,
+        mut path_filter: impl FnMut(DataDirectory) -> bool + 'path_filter,
+    ) -> impl Iterator<Item = walkdir::Result<Benchmark>> + 'path_filter {
+        let data_root = self.data_root.clone();
+        let walker = self.walker.filter_entry(move |entry| {
+            if entry.file_type().is_dir() {
+                path_filter(DataDirectory::new(&data_root, entry))
+            } else {
+                true
+            }
+        });
+        BenchmarkIter::new(self.data_root, walker)
+    }
+}
+
+/// Criterion benchmark data directory
+#[derive(Debug)]
+pub struct DataDirectory<'dirwalk> {
+    data_root: &'dirwalk Path,
+    entry: &'dirwalk DirEntry,
+}
+//
+impl<'dirwalk> DataDirectory<'dirwalk> {
+    /// Wrap a directory entry from [`WalkDir`] in a nice façade that hides
+    /// user-irrelevant details
+    fn new(data_root: &'dirwalk Path, entry: &'dirwalk DirEntry) -> Self {
+        debug_assert!(!entry.path_is_symlink() && entry.file_type().is_dir() && entry.depth() > 0);
+        Self { data_root, entry }
+    }
+
+    /// Name of this data directory (without the path leading to it)
+    pub fn dir_name(&self) -> &str {
+        self.entry
+            .file_name()
+            .to_str()
+            .expect("Criterion should not generate non-Unicode names")
+    }
+
+    /// Depth at which this data directory appears
+    ///
+    /// Top-level data directories have depth 1, their children have depth 2,
+    /// their grandchildren have depth 3, and so on.
+    pub fn depth(&self) -> usize {
+        self.entry.depth()
+    }
+
+    /// Relative path to this data directory from the Criterion data root
+    pub fn path_from_data_root(&self) -> &Path {
+        self.entry
+            .path()
+            .strip_prefix(self.data_root)
+            .expect("Walkdir should prefix entry paths with the search root path")
+    }
+}
+
+/// Benchmark iterator
+///
+/// Wraps a walkdir iterator by adding a layer that collects all the files from
+/// the current directory before yielding them as a single [`Benchmark`].
+struct BenchmarkIter<Walker: Iterator> {
+    /// Root of the directory walk
+    data_root: Box<Path>,
+
+    /// Underlying directory walker
+    walker: Peekable<Walker>,
+
+    /// Files seen so far in the current directory
+    files_in_current_dir: Vec<DirEntry>,
+
+    /// There is no benchmark data and this iterator should always yield None
+    ///
+    /// This is used to work around the fact that `walkdir` returns errors when
+    /// the data directory to be walked does not exists, whereas we want to
+    /// treat this as a normal situation where there is no benchmark data.
+    no_data: bool,
+}
+//
+impl<Walker: Iterator> BenchmarkIter<Walker> {
+    /// Set up a benchmark iterator
+    ///
+    /// This is an implementation detail of [`Search`], and it is assumed that
+    /// all preparations from [`Search::in_cargo_root()`] have been done.
+    fn new(data_root: Box<Path>, walker: Walker) -> Self {
+        let no_data = !data_root.exists();
+        BenchmarkIter {
+            data_root,
+            walker: walker.peekable(),
+            files_in_current_dir: Vec::new(),
+            no_data,
+        }
+    }
+
+    /// Reached end of file list for current depth, produce a Benchmark from it
+    fn emit_benchmark(&mut self) -> Option<walkdir::Result<Benchmark>> {
+        // Last file will be benchmark.cbor due to the sorting we applied
+        let metadata = self.files_in_current_dir.pop()?;
+        let measurements = std::mem::take(&mut self.files_in_current_dir).into_boxed_slice();
+        Some(Ok(Benchmark::new(&self.data_root, metadata, measurements)))
+    }
+}
+//
+impl<Walker> Iterator for BenchmarkIter<Walker>
+where
+    Walker: Iterator<Item = walkdir::Result<DirEntry>>,
+{
+    type Item = walkdir::Result<Benchmark>;
+    fn next(&mut self) -> Option<Self::Item> {
+        // Yield None if there is no benchmark data
+        if self.no_data {
+            return None;
+        }
+
+        // Otherwise, collect files from the next `Benchmark`, if any
+        'files: loop {
+            // Fetch next entry from dir walker, handling errors and end-of-walk
+            let entry = match self.walker.peek() {
+                Some(Ok(entry)) => entry,
+                Some(Err(_)) => {
+                    return self
+                        .walker
+                        .next()
+                        .map(|err| err.map(|_| unreachable!("Peeked Err() above")))
+                }
+                None => return self.emit_benchmark(),
+            };
+
+            // Makes sure entries meet expectations
+            let ty = entry.file_type();
+            assert!(
+                !entry.path_is_symlink(),
+                "No symlink expected in Criterion data directory"
+            );
+            assert!(
+                ty.is_file() || ty.is_dir(),
+                "Only files & subdirectories expected inside of Criterion data directory"
+            );
+            debug_assert!(
+                entry.depth() >= 1,
+                "Root directory should filtered out by min_depth"
+            );
+
+            // Are we currently collecting files from a benchmark?
+            if let Some(last_file) = self.files_in_current_dir.last() {
+                if entry.depth() == last_file.depth()
+                    && entry.file_type().is_file()
+                    && entry.path().parent() == last_file.path().parent()
+                {
+                    // This is a file from the same benchmark directory, add it
+                    // to the list and keep checking next files.
+                    self.files_in_current_dir.push(
+                        self.walker
+                            .next()
+                            .expect("Peeked Some() above")
+                            .expect("Peeked Ok() above"),
+                    );
+                    continue 'files;
+                } else {
+                    // This not a file from the same benchmark directory. Flush
+                    // all files seen so far into a new benchmark, and yield
+                    // that benchmark. We'll get back to the current entry next
+                    // time Iterator::next() is called.
+                    return self.emit_benchmark();
                 }
             }
+
+            // If control reached this point, then the files_in_current_dir list
+            // is empty and we are not going to emit a benchmark. So we can
+            // commit to popping the entry from the iterator.
+            assert!(self.files_in_current_dir.is_empty());
+            let entry = self
+                .walker
+                .next()
+                .expect("Peeked Some() above")
+                .expect("Peeked Ok() above");
+
+            // If this is a file, start a new benchmark. Ignore directories.
+            if ty.is_file() {
+                self.files_in_current_dir.push(entry);
+            }
         }
-        assert_eq!(
-            metadata_path.is_some(),
-            !measurements.is_empty(),
-            "Expecting benchmark.cbor if and only if measurements are present"
-        );
-        assert!(
-            !(measurements.is_empty() && children.is_empty()),
-            "Unexpected empty criterion data directory"
-        );
-        self.measurements = Some((metadata_path, measurements));
-        self.children = Some(children);
-        Ok(())
     }
 }
 
 /// Benchmark for which `cargo criterion` has recorded data
 #[derive(Debug)]
 pub struct Benchmark {
-    metadata_path: Box<Path>,
-    measurements: Vec<DirEntry>,
+    path_from_data_root: Box<Path>,
+    metadata: DirEntry,
+    measurements: Box<[DirEntry]>,
 }
 //
 impl Benchmark {
     /// If a directory contains benchmark data, let the user access it
-    fn new(metadata_path: Box<Path>, measurements: Vec<DirEntry>) -> Self {
-        debug_assert!(
-            metadata_path.exists() && !measurements.is_empty(),
+    fn new(data_root: &Path, metadata: DirEntry, measurements: Box<[DirEntry]>) -> Self {
+        assert!(
+            metadata.file_type().is_file() && metadata.file_name() == "benchmark.cbor",
+            "Encountered unexpected file {metadata:?} in Criterion data directory"
+        );
+        assert!(
+            !measurements.is_empty(),
             "Attempted to construct a Benchmark even though there's no measurements"
         );
+        let parent_dir = metadata
+            .path()
+            .parent()
+            .expect("Detected benchmark.cbor file should lie inside a parent directory");
+        let path_from_data_root = parent_dir.strip_prefix(data_root).expect(
+            "Detected benchmark.cbor file should be inside of the Criterion data directory root",
+        );
         Self {
-            metadata_path,
+            path_from_data_root: path_from_data_root.into(),
+            metadata,
             measurements,
         }
     }
 
-    /// Load this benchmark's metadata
+    /// Relative path to this benchmark's data directory from the Criterion data root
+    pub fn path_from_data_root(&self) -> &Path {
+        &self.path_from_data_root
+    }
+
+    /// Read this benchmark's metadata
     pub fn metadata(&self) -> io::Result<BenchmarkMetadata> {
-        let data = std::fs::read(&self.metadata_path)?;
+        let data = std::fs::read(self.metadata.path())?;
         Ok(serde_cbor::from_slice(&data[..]).expect("Failed to deserialize benchmark metadata"))
     }
 
     /// Enumerate this benchmark's measurements
-    pub fn measurements(&self) -> impl Iterator<Item = io::Result<Measurement>> + '_ {
+    pub fn measurements(&self) -> impl Iterator<Item = Measurement> + '_ {
         self.measurements.iter().map(Measurement::new)
     }
 }
@@ -224,19 +351,19 @@ pub struct BenchmarkMetadata {
 }
 //
 impl BenchmarkMetadata {
-    /// Low-resolution date and time of the latest measurement
+    /// Local date and time of the latest measurement
     ///
-    /// This is identical to [`Measurement::datetime()`] for the corresponding
-    /// measurement, which can be used to locate it within the
-    /// [`Benchmark::measurements`] iterator.
+    /// This is identical to [`Measurement::local_datetime()`] for the
+    /// corresponding measurement, which can be used to locate said measurement
+    /// within the [`Benchmark::measurements`] iterator.
     ///
-    /// A more precise timestamp (sub-second, UTC...) is available via
-    /// [`MeasurementData::datetime`].
-    pub fn latest_datetime(&self) -> DateTime<Local> {
+    /// A more precise timestamp (sub-second, UTC...) can be found inside of
+    /// individual measurement files via [`MeasurementData::datetime`].
+    pub fn latest_local_datetime(&self) -> MappedLocalTime<DateTime<Local>> {
         parse_measurement_datetime(
             self.latest_record
                 .file_name()
-                .expect("Latest record should be a file"),
+                .expect("Latest record field should point to a measurement file"),
         )
     }
 }
@@ -347,6 +474,7 @@ impl RawBenchmarkId {
 }
 //
 /// High-level interpretation of a [`RawBenchmarkId`]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BenchmarkId<'raw> {
     /// This benchmark was performed using [`Criterion::bench_function()`]
     BenchFunction(&'raw str),
@@ -364,11 +492,13 @@ pub enum BenchmarkId<'raw> {
     ///   [`BenchmarkId::from_parameter(parameter)`](criterion::BenchmarkId::from_parameter).
     ///
     /// Unfortunately, the criterion metadata schema is ambiguous and does not
-    /// let us tell you which of these benchmarking procedures was used.
+    /// let us tell you which of these benchmarking procedures was used without
+    /// supplementary information.
     AmbiguousFromParameter {
         /// If this benchmark is part of a group, then this is the group's name.
-        /// Otherwise it is the function name of a `bench_with_input()`
-        /// benchmark performed outside of a criterion group.
+        /// Otherwise it is the `function_name` that was passed to
+        /// [`BenchmarkId::new()`](criterion::BenchmarkId::new) at the time
+        /// where [`Criterion::bench_with_input()`] was called.
         group_or_function_id: &'raw str,
 
         /// String that identifies the benchmark input
@@ -389,8 +519,10 @@ pub enum BenchmarkId<'raw> {
 }
 //
 /// Textual identifier(s) of this benchmark inside of the group
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MemberId<'raw> {
-    /// Textual identifier passed to [`BenchmarkGroup::bench_function()`] or
+    /// Textual identifier that was passed to
+    /// [`BenchmarkGroup::bench_function()`] or
     /// [`BenchmarkGroup::bench_with_input()`]
     String(&'raw str),
 
@@ -405,8 +537,8 @@ pub enum MemberId<'raw> {
     /// [`BenchmarkId::from_parameter()`]: criterion::BenchmarkId::from_parameter
     FromParameter(&'raw str),
 
-    /// Full benchmark identifier, featuring both a function name and parameter
-    /// string, that was generated using
+    /// Full benchmark identifier, featuring both a function name and a
+    /// parameter identification string, that was generated using
     /// [`BenchmarkId::new()`](criterion::BenchmarkId::new).
     Full {
         function_name: &'raw str,
@@ -418,27 +550,25 @@ pub enum MemberId<'raw> {
 #[derive(Debug)]
 pub struct Measurement<'parent> {
     entry: &'parent DirEntry,
-    datetime: DateTime<Local>,
 }
 //
 impl<'parent> Measurement<'parent> {
     /// Wrap a `DirEntry` after checking that it matches our expectations for
     /// `cargo-criterion`'s benchmark data directories.
-    fn new(entry: &'parent DirEntry) -> io::Result<Self> {
+    fn new(entry: &'parent DirEntry) -> Self {
         assert!(
-            entry.file_type()?.is_file(),
+            entry.file_type().is_file(),
             "Criterion's benchmark directories should only contain data files"
         );
-        let datetime = parse_measurement_datetime(entry.file_name());
-        Ok(Self { entry, datetime })
+        Self { entry }
     }
 
-    /// Date and time at which this measurement was taken
-    pub fn datetime(&self) -> DateTime<Local> {
-        self.datetime
+    /// Local date and time at which this measurement was taken
+    pub fn local_datetime(&self) -> MappedLocalTime<DateTime<Local>> {
+        parse_measurement_datetime(self.entry.file_name())
     }
 
-    /// Data from this measurement
+    /// Read this measurement's data
     pub fn data(&self) -> io::Result<MeasurementData> {
         let data = std::fs::read(self.entry.path())?;
         Ok(serde_cbor::from_slice(&data[..]).expect("Failed to deserialize benchmark metadata"))
@@ -511,7 +641,7 @@ pub struct ConfidenceInterval {
 }
 //
 /// Statistical change detected across benchmark runs
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 pub enum ChangeDirection {
     NoChange,
     NotSignificant,
@@ -520,7 +650,7 @@ pub enum ChangeDirection {
 }
 
 /// Parse a measurement file name to find the measurement date & time
-fn parse_measurement_datetime(file_name: impl AsRef<OsStr>) -> DateTime<Local> {
+fn parse_measurement_datetime(file_name: impl AsRef<OsStr>) -> MappedLocalTime<DateTime<Local>> {
     let datetime = file_name
         .as_ref()
         .to_str()
@@ -531,5 +661,5 @@ fn parse_measurement_datetime(file_name: impl AsRef<OsStr>) -> DateTime<Local> {
         .expect("Measurement file name should end with .cbor extension");
     let datetime = NaiveDateTime::parse_from_str(datetime, "%y%m%d%H%M%S")
         .expect("Unexpected criterion measurement date/time format");
-    Local.from_local_datetime(&datetime).unwrap()
+    Local.from_local_datetime(&datetime)
 }
