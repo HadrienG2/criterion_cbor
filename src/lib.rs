@@ -6,6 +6,9 @@
 //! [`find_in_paths()`](Search::find_in_paths) method of the resulting object to
 //! start enumerating data.
 
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
+
 use chrono::{DateTime, Local, MappedLocalTime, NaiveDateTime, TimeZone, Utc};
 use criterion::Throughput;
 #[cfg(doc)]
@@ -649,16 +652,21 @@ pub enum ChangeDirection {
     Regressed,
 }
 
-/// Parse a measurement file name to find the measurement date & time
-fn parse_measurement_datetime(file_name: impl AsRef<OsStr>) -> MappedLocalTime<DateTime<Local>> {
-    let datetime = file_name
-        .as_ref()
+/// Extract the minimal identifier from a measurement file name, which is a
+/// local date/time in YYMMDDHHMMSS format.
+fn parse_measurement_id<'file_name>(file_name: &OsStr) -> &str {
+    file_name
         .to_str()
         .expect("Measurement file name should be Unicode")
         .strip_prefix("measurement_")
         .expect("Measurement file name should start with measurement_")
         .strip_suffix(".cbor")
-        .expect("Measurement file name should end with .cbor extension");
+        .expect("Measurement file name should end with .cbor extension")
+}
+
+/// Parse a measurement file name to find the measurement date & time
+fn parse_measurement_datetime(file_name: impl AsRef<OsStr>) -> MappedLocalTime<DateTime<Local>> {
+    let datetime = parse_measurement_id(file_name.as_ref());
     let datetime = NaiveDateTime::parse_from_str(datetime, "%y%m%d%H%M%S")
         .expect("Unexpected criterion measurement date/time format");
     Local.from_local_datetime(&datetime)
