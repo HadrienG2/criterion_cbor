@@ -4,17 +4,33 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-# FIXME: Remove once we get closer to production
-default = ["sqlite"]
+default = [
+    "log",
+    # FIXME: Remove once we get closer to production
+    "sqlite"
+]
+
+# Log information about what we're doing
+log = ["dep:log"]
 
 # Enable re-exporting the measurement data as an SQLite database
 sqlite = ["dep:rusqlite", "dep:thiserror"]
 
 [dependencies]
+# Minimum needed for Criterion CBOR discovery and parsing
 chrono = { version = "0.4.39", default-features = false, features = ["clock", "serde", "std"] }
 criterion = { version = "0.5.1", default-features = false }
-rusqlite = { version = "0.33", optional = true }
 serde = { version = "1.0.217", features = ["derive"] }
 serde_cbor = "0.11.2"
-thiserror = { version = "2.0.11", optional = true }
 walkdir = "2.5.0"
+
+# Logging
+log = { version = "0.4", optional = true }
+
+# SQLite interface
+rusqlite = { version = "0.33", optional = true }
+thiserror = { version = "2.0.11", optional = true }
+
+[dev-dependencies]
+# Logging inside of examples
+env_logger = "0.11"
