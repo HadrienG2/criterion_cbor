@@ -31,7 +31,7 @@ pub struct Search {
 }
 //
 impl Search {
-    /// Start by specifying the location of Cargo's `target` directory
+    /// Start by specifying the Cargo hierarchy root
     ///
     /// For Cargo workspaces, this will be the root of the workspace. For
     /// non-workspace projects, this will be the root of the Cargo project,
@@ -44,8 +44,25 @@ impl Search {
         // Find the Criterion data root
         let cargo_root = cargo_root.as_ref();
         assert!(cargo_root.exists(), "Specified Cargo root does not exist");
-        let mut data_root = cargo_root.to_owned();
-        data_root.push("target");
+        Self::in_target_dir(cargo_root.join("target"))
+    }
+
+    /// Start by specifying the target directory location
+    ///
+    /// Like [`in_cargo_root()`](Self::in_cargo_root()), but you directly
+    /// specify the path to the `target` directory, which must already exist.
+    ///
+    /// # Panics
+    ///
+    /// If the specified directory does not exist.
+    pub fn in_target_dir(target_path: impl AsRef<Path>) -> Self {
+        // Find the Criterion data root
+        let target_path = target_path.as_ref();
+        assert!(
+            target_path.exists(),
+            "Specified target directory does not exist"
+        );
+        let mut data_root = target_path.to_owned();
         data_root.push("criterion");
         data_root.push("data");
         // This is the "timeline" field of cargo-criterion's Model, which is
